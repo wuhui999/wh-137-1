@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import {
   ArrowLeft,
@@ -10,6 +10,8 @@ import {
   ChevronRight,
   TrendingUp,
   Wind,
+  CheckCircle,
+  Save,
 } from 'lucide-react';
 import { useAppStore } from '@/store';
 import ScoreDisplay from '@/components/ScoreDisplay';
@@ -41,6 +43,13 @@ export default function Practice() {
   const [loopStart, setLoopStart] = useState(1);
   const [loopEnd, setLoopEnd] = useState(2);
   const [elapsed, setElapsed] = useState(0);
+  const [showSavedToast, setShowSavedToast] = useState(false);
+  const [savedMessage, setSavedMessage] = useState('');
+
+  const sessionRef = useRef(session);
+  sessionRef.current = session;
+  const elapsedRef = useRef(elapsed);
+  elapsedRef.current = elapsed;
 
   const measures = useMemo(() => {
     if (!score) return [];
@@ -50,11 +59,24 @@ export default function Practice() {
   const currentNoteIndex = session?.currentNoteIndex ?? 0;
   const currentNote = score?.notes[currentNoteIndex];
 
+  const showToast = (msg: string) => {
+    setSavedMessage(msg);
+    setShowSavedToast(true);
+    setTimeout(() => setShowSavedToast(false), 2500);
+  };
+
   useEffect(() => {
     if (!scoreId) return;
     startSession(scoreId);
+    setElapsed(0);
+    setIsPlaying(false);
+    setCurrentCents(0);
+    setLastDeviation(null);
     return () => {
-      if (session) endSession();
+      const current = sessionRef.current;
+      if (current && current.deviations.length > 0) {
+        try { endSession(); } catch (e) { /* ignore */ }
+      }
     };
   }, [scoreId]);
 
@@ -63,6 +85,40 @@ export default function Practice() {
     const interval = setInterval(() => setElapsed((e) => e + 1), 1000);
     return () => clearInterval(interval);
   }, [isPlaying]);
+
+  const handleFinishAndSave = useCallback(() => {
+    const currentSession = sessionRef.current;
+    const deviations = currentSession?.deviations ?? [];
+    const deviationCount = deviations.length;
+    if (deviationCount === 0) {
+      showToast('还没有吹奏任何音符，未保存记录');
+      setIsPlaying(false);
+      return;
+    }
+    try {
+      const accuracy =
+        deviationCount > 0
+          ? Math.round(
+              (deviations.filter((d) => Math.abs(d.centsDeviation) <= 25).length / deviationCount) * 100
+            )
+          : 0;
+      const avgCentsVal =
+        deviationCount > 0
+          ? (deviations.reduce((sum, d) => sum + d.centsDeviation, 0) / deviationCount).toFixed(1)
+          : '0';
+      endSession();
+      showToast(`练习已保存！准确率 ${accuracy}%，平均偏差 ${avgCentsVal} 音分，共 ${deviationCount} 个音符`);
+      setTimeout(() => {
+        if (scoreId) startSession(scoreId);
+        setIsPlaying(false);
+        setElapsed(0);
+        setCurrentCents(0);
+        setLastDeviation(null);
+      }, 300);
+    } catch (e) {
+      showToast('保存失败，请重试');
+    }
+  }, [scoreId, endSession, startSession]);
 
   const handleNoteOn = useCallback(
     (midi: number) => {
@@ -81,29 +137,29 @@ export default function Practice() {
       setLastDeviation(deviation);
       addDeviation(deviation);
 
-      if (isPlaying) {
-        setTimeout(() => {
-          const nextIndex = currentNoteIndex + 1;
-          if (nextIndex < score.notes.length) {
-            if (loopEnabled) {
-              const nextNote = score.notes[nextIndex];
-              if (nextNote.measure > loopEnd) {
-                const firstInLoop = score.notes.findIndex((n) => n.measure === loopStart);
-                setCurrentNote(firstInLoop >= 0 ? firstInLoop : 0);
-              } else {
-                setCurrentNote(nextIndex);
-              }
+      setTimeout(() => {
+        const nextIndex = currentNoteIndex + 1;
+        if (nextIndex < score.notes.length) {
+          if (loopEnabled) {
+            const nextNote = score.notes[nextIndex];
+            if (nextNote.measure > loopEnd) {
+              const firstInLoop = score.notes.findIndex((n) => n.measure === loopStart);
+              setCurrentNote(firstInLoop >= 0 ? firstInLoop : 0);
             } else {
               setCurrentNote(nextIndex);
             }
-          } else if (loopEnabled) {
-            const firstInLoop = score.notes.findIndex((n) => n.measure === loopStart);
-            setCurrentNote(firstInLoop >= 0 ? firstInLoop : 0);
+          } else {
+            setCurrentNote(nextIndex);
           }
-        }, score.tempo ? (60 / score.tempo) * 500 : 500);
-      }
+        } else if (loopEnabled) {
+          const firstInLoop = score.notes.findIndex((n) => n.measure === loopStart);
+          setCurrentNote(firstInLoop >= 0 ? firstInLoop : 0);
+        } else {
+          handleFinishAndSave();
+        }
+      }, score.tempo ? (60 / score.tempo) * 500 : 500);
     },
-    [score, currentNote, currentNoteIndex, isPlaying, loopEnabled, loopStart, loopEnd]
+    [score, currentNote, currentNoteIndex, loopEnabled, loopStart, loopEnd, addDeviation, handleFinishAndSave]
   );
 
   const handlePrevNote = () => {
@@ -117,14 +173,33 @@ export default function Practice() {
   };
 
   const handleReset = () => {
-    setCurrentNote(0);
+    if (session?.deviations && session.deviations.length > 0) {
+      if (!confirm('重置将清空当前练习的偏差数据，确定要重置吗？')) return;
+    }
+    if (scoreId) {
+      startSession(scoreId);
+    }
     setCurrentCents(0);
     setLastDeviation(null);
     setElapsed(0);
+    setIsPlaying(false);
+  };
+
+  const handleManualSave = () => {
+    handleFinishAndSave();
   };
 
   const togglePlaying = () => {
-    setIsPlaying(!isPlaying);
+    if (isPlaying) {
+      handleFinishAndSave();
+    } else {
+      if (!session) {
+        if (scoreId) startSession(scoreId);
+      }
+      setIsPlaying(true);
+      setElapsed(0);
+      showToast('练习已开始，请按目标音高吹奏，完成后将自动保存');
+    }
   };
 
   const toggleLoop = () => {
@@ -159,7 +234,42 @@ export default function Practice() {
       : 0;
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 relative">
+      <div
+        className={`fixed top-24 right-6 z-50 transition-all duration-500 ${
+          showSavedToast
+            ? 'opacity-100 translate-y-0'
+            : 'opacity-0 -translate-y-4 pointer-events-none'
+        }`}
+      >
+        <div className="glass-card flex items-center gap-3 px-5 py-3 shadow-glow-lg border-gold-400/40">
+          <CheckCircle className="w-5 h-5 text-emerald-400 flex-shrink-0" />
+          <span className="text-sm text-navy-100">{savedMessage}</span>
+        </div>
+      </div>
+
+      <div className="glass-card p-4 border-sky-400/30 bg-sky-500/5">
+        <div className="text-xs text-sky-300 font-semibold mb-2">💡 保存历史记录的 4 种途径</div>
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3 text-xs text-navy-300">
+          <div className="flex items-start gap-2">
+            <span className="text-gold-400 font-bold">1.</span>
+            <span><b className="text-navy-100">自动保存：</b>所有音符吹奏完毕后自动保存并重置</span>
+          </div>
+          <div className="flex items-start gap-2">
+            <span className="text-gold-400 font-bold">2.</span>
+            <span><b className="text-navy-100">停止按钮：</b>点击「停止并保存」立即保存当前进度</span>
+          </div>
+          <div className="flex items-start gap-2">
+            <span className="text-gold-400 font-bold">3.</span>
+            <span><b className="text-navy-100">手动保存：</b>点击「手动保存」随时保存当前进度</span>
+          </div>
+          <div className="flex items-start gap-2">
+            <span className="text-gold-400 font-bold">4.</span>
+            <span><b className="text-navy-100">离开页面：</b>切换路由/关闭页面时自动保存（有数据时）</span>
+          </div>
+        </div>
+      </div>
+
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-4">
           <button
@@ -249,17 +359,24 @@ export default function Practice() {
               />
             </div>
 
-            <div className="flex items-center gap-3 mt-5">
+            <div className="flex items-center gap-3 mt-5 flex-wrap">
               <button onClick={togglePlaying} className={isPlaying ? 'btn-ghost' : 'btn-gold'}>
                 {isPlaying ? (
                   <span className="flex items-center gap-2">
-                    <Square className="w-4 h-4" /> 停止
+                    <Square className="w-4 h-4" /> 停止并保存
                   </span>
                 ) : (
                   <span className="flex items-center gap-2">
-                    <Play className="w-4 h-4" /> 开始
+                    <Play className="w-4 h-4" /> 开始练习
                   </span>
                 )}
+              </button>
+              <button
+                onClick={handleManualSave}
+                disabled={!session || session.deviations.length === 0}
+                className="btn-ghost flex items-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                <Save className="w-4 h-4" /> 手动保存
               </button>
               <button onClick={handleReset} className="btn-ghost flex items-center gap-2">
                 <RotateCcw className="w-4 h-4" /> 重置
